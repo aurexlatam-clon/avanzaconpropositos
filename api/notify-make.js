@@ -21,7 +21,8 @@ const ALLOWED_FIELDS = [
   // Funnel webinario (lime-webinar)
   'webinar_date',
   'webinar_label',
-  'guia_url'
+  'guia_url',
+  'wa_code'
 ];
 
 const MAX_LEN = 300;
@@ -33,10 +34,24 @@ function sanitizeString(value) {
   return value.replace(/[\x00-\x1F\x7F]/g, '').trim().slice(0, MAX_LEN);
 }
 
+// Misma regla que el formulario (index.html). Estricta a propósito: un correo
+// mal escrito que llegue a HubSpot puede detener el escenario de Make.
+const EMAIL_RE = /^[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,24}$/;
+const TLD_TYPOS = ['con', 'cmo', 'comm', 'coom', 'vom', 'xom', 'cpm', 'ocm'];
+
 function isValidEmail(value) {
-  if (!value) return true; // el campo es opcional; si viene vacío, se acepta vacío
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+  if (!value || value.length > 120) return false;
+  if (!EMAIL_RE.test(value) || value.indexOf('..') !== -1) return false;
+  const [local, domain] = value.split('@');
+  if (local.startsWith('.') || local.endsWith('.')) return false;
+  const tld = domain.split('.').pop();
+  return !TLD_TYPOS.includes(tld);
 }
+
+// Eventos de REGISTRO: son los únicos que exigen correo válido.
+// '' = registro del funnel original (no manda event_type).
+// Eventos posteriores (video_progress, quiz_completed, etc.) no se bloquean.
+const REGISTRATION_EVENTS = ['', 'registro', 'webinar_registro'];
 
 function isValidLeadId(value) {
   // Formato que genera nuestro propio snippet: lead_<base36>_<random>
@@ -70,8 +85,22 @@ module.exports = async function handler(req, res) {
   if (!clean.lead_id || !isValidLeadId(clean.lead_id)) {
     return res.status(400).json({ ok: false, error: 'invalid_lead_id' });
   }
-  if (!isValidEmail(clean.email)) {
-    return res.status(400).json({ ok: false, error: 'invalid_email' });
+  clean.email = clean.email.toLowerCase();
+  const requiresEmail = REGISTRATION_EVENTS.includes(clean.event_type);
+
+  if (requiresEmail) {
+    if (!isValidEmail(clean.email)) {
+      // Se rechaza SIN llamar al webhook: Make/HubSpot nunca reciben el dato malo.
+      return res.status(400).json({
+        ok: false,
+        error: 'invalid_email',
+        message: 'Correo electrónico inválido. El registro no se envió a Make.'
+      });
+    }
+  } else if (clean.email && !isValidEmail(clean.email)) {
+    // Evento posterior con un correo malo: no se bloquea el evento,
+    // solo no se reenvía ese correo a Make.
+    clean.email = '';
   }
 
   const webhookUrl = process.env.MAKE_WEBHOOK_URL;
